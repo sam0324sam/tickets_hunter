@@ -33,12 +33,14 @@ from nodriver_common import (
     CONST_FROM_TOP_TO_BOTTOM,
     CONST_MAXBOT_ANSWER_ONLINE_FILE,
     CONST_MAXBOT_INT28_FILE,
+    CONST_NATIVE_INPUT_SETTER_JS,
 )
 
 __all__ = [
     "nodriver_kham_login",
     "nodriver_kham_go_buy_redirect",
     "nodriver_kham_check_realname_dialog",
+    "nodriver_kham_check_vip_priority_dialog",
     "nodriver_kham_allow_not_adjacent_seat",
     "nodriver_kham_switch_to_auto_seat",
     "nodriver_kham_check_captcha_text_error",
@@ -323,6 +325,77 @@ async def nodriver_kham_check_realname_dialog(tab, config_dict):
         debug.log("Check realname dialog exception:", exc)
 
     return is_realname_dialog_found
+
+async def nodriver_kham_check_vip_priority_dialog(tab, config_dict):
+    """
+    Check and handle KHAM VIP cardholder priority purchase dialog (.popoutBG).
+    Fills credit_card_prefix into #ID1 and triggers submit (DoVIPLogin).
+    Strictly uses contact.credit_card_prefix without falling back to other values.
+    """
+    debug = util.create_debug_logger(config_dict)
+
+    credit_card_prefix = config_dict.get("contact", {}).get("credit_card_prefix", "").strip()
+    if not credit_card_prefix:
+        debug.log("[KHAM VIP] credit_card_prefix is not configured, waiting for manual input")
+        return False
+
+    prefix_js = json.dumps(credit_card_prefix)
+
+    try:
+        result_raw = await tab.evaluate(f'''
+            (() => {{
+                {CONST_NATIVE_INPUT_SETTER_JS}
+
+                const popup = document.querySelector('.popoutBG');
+                if (!popup) return {{ found: false, reason: 'no_popup' }};
+
+                const style = window.getComputedStyle(popup);
+                if (style.display === 'none' || style.visibility === 'hidden') {{
+                    return {{ found: false, reason: 'popup_hidden' }};
+                }}
+
+                const input1 = popup.querySelector('#ID1') || document.querySelector('#ID1');
+                if (!input1) return {{ found: true, filled: false, reason: 'no_id1_input' }};
+
+                // Check if submission is already in-flight (isClick flag in page script)
+                if (typeof isClick !== 'undefined' && isClick) {{
+                    return {{ found: true, filled: true, submitting: true }};
+                }}
+
+                // Fill credit_card_prefix using native setter
+                const is_set = setNativeInputValue(input1, {prefix_js});
+
+                // Trigger submit via button click or DoVIPLogin function
+                const submitBtn = popup.querySelector('button[onclick*="DoVIPLogin"], button.red');
+                if (submitBtn) {{
+                    submitBtn.click();
+                    return {{ found: true, filled: is_set, submitted: true, method: 'btn_click' }};
+                }} else if (typeof DoVIPLogin === 'function') {{
+                    DoVIPLogin();
+                    return {{ found: true, filled: is_set, submitted: true, method: 'func_call' }};
+                }}
+
+                return {{ found: true, filled: is_set, submitted: false, reason: 'no_submit_btn' }};
+            }})()
+        ''')
+
+        result = util.parse_nodriver_result(result_raw)
+        if isinstance(result, dict):
+            if result.get('submitting'):
+                debug.log("[KHAM VIP] VIP priority purchase request is already in-flight")
+                return True
+            if result.get('submitted'):
+                masked_prefix = credit_card_prefix[:2] + "****" if len(credit_card_prefix) >= 2 else "****"
+                debug.log(f"[KHAM VIP] Card prefix filled ({masked_prefix}) and submitted via {result.get('method')}")
+                return True
+            if result.get('found'):
+                debug.log(f"[KHAM VIP] VIP popup found but not submitted: {result.get('reason')}")
+                return False
+
+    except Exception as exc:
+        debug.log(f"[KHAM VIP] Error checking VIP priority dialog: {exc}")
+
+    return False
 
 async def nodriver_kham_allow_not_adjacent_seat(tab, config_dict):
     """
@@ -1714,8 +1787,17 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
         # Check realname dialog first
         await nodriver_kham_check_realname_dialog(tab, config_dict)
 
-        # Stage 4: select the correct performance row (keyword_exclude + mode aware)
-        await nodriver_kham_date_auto_select(tab, domain_name, config_dict)
+        # Pre-check VIP priority dialog
+        is_vip_handled = await nodriver_kham_check_vip_priority_dialog(tab, config_dict)
+        if not is_vip_handled:
+            # Stage 4: select the correct performance row (keyword_exclude + mode aware)
+            is_date_selected = await nodriver_kham_date_auto_select(tab, domain_name, config_dict)
+            if is_date_selected:
+                # Post-check: wait briefly for VIP dialog to appear after clicking date
+                for _ in range(5):
+                    await tab.sleep(0.2)
+                    if await nodriver_kham_check_vip_priority_dialog(tab, config_dict):
+                        break
 
     # Product page (UTK0201_.aspx?product_id=)
     if 'utk0201_.aspx?product_id=' in url.lower():
@@ -1780,8 +1862,17 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
     if 'utk0201_00.aspx?product_id=' in url.lower():
         is_event_page = len(url.split('/')) == 6
 
-        if is_event_page and config_dict["date_auto_select"]["enable"]:
-            await nodriver_kham_product(tab, domain_name, config_dict)
+        if is_event_page:
+            # Pre-check: if VIP priority purchase dialog (.popoutBG) is already visible, handle it first
+            is_vip_handled = await nodriver_kham_check_vip_priority_dialog(tab, config_dict)
+            if not is_vip_handled and config_dict["date_auto_select"]["enable"]:
+                is_date_selected = await nodriver_kham_product(tab, domain_name, config_dict)
+                if is_date_selected:
+                    # Post-check: wait briefly for VIP dialog to appear after clicking date
+                    for _ in range(5):
+                        await tab.sleep(0.2)
+                        if await nodriver_kham_check_vip_priority_dialog(tab, config_dict):
+                            break
 
     # UDN specific handling
     if 'udnfunlife' in domain_name:
