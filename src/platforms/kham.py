@@ -33,7 +33,6 @@ from nodriver_common import (
     CONST_FROM_TOP_TO_BOTTOM,
     CONST_MAXBOT_ANSWER_ONLINE_FILE,
     CONST_MAXBOT_INT28_FILE,
-    CONST_NATIVE_INPUT_SETTER_JS,
 )
 
 __all__ = [
@@ -330,6 +329,9 @@ async def nodriver_kham_check_vip_priority_dialog(tab, config_dict):
     """
     Check and handle KHAM VIP cardholder priority purchase dialog (.popoutBG).
     Fills credit_card_prefix into #ID1 and triggers submit (DoVIPLogin).
+    Automatically detects whether the event requires 6 or 8 digits based on
+    keywords in the prompt label (#L_ID1) and title (#L_NAME_TITLE), and slices
+    the configured prefix accordingly.
     Strictly uses contact.credit_card_prefix without falling back to other values.
     """
     debug = util.create_debug_logger(config_dict)
@@ -344,7 +346,18 @@ async def nodriver_kham_check_vip_priority_dialog(tab, config_dict):
     try:
         result_raw = await tab.evaluate(f'''
             (() => {{
-                {CONST_NATIVE_INPUT_SETTER_JS}
+                const setNativeInputValue = (input, value) => {{
+                    const descriptor = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value');
+                    if (descriptor && descriptor.set) {{
+                        descriptor.set.call(input, value);
+                    }} else {{
+                        input.value = value;
+                    }}
+                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return input.value === value;
+                }};
 
                 const popup = document.querySelector('.popoutBG');
                 if (!popup) return {{ found: false, reason: 'no_popup' }};
@@ -362,17 +375,53 @@ async def nodriver_kham_check_vip_priority_dialog(tab, config_dict):
                     return {{ found: true, filled: true, submitting: true }};
                 }}
 
+                // Inspect prompt text to determine expected digit length (6 or 8)
+                const labelEl = popup.querySelector('#L_ID1') || document.querySelector('#L_ID1');
+                const titleEl = popup.querySelector('#L_NAME_TITLE') || document.querySelector('#L_NAME_TITLE');
+                const labelText = labelEl ? (labelEl.textContent || '') : '';
+                const titleText = titleEl ? (titleEl.textContent || '') : '';
+                const combinedText = (labelText + ' ' + titleText).toLowerCase();
+
+                let targetLen = 0;
+                if (combinedText.includes('八') || combinedText.includes('8')) {{
+                    targetLen = 8;
+                }} else if (combinedText.includes('六') || combinedText.includes('6')) {{
+                    targetLen = 6;
+                }}
+
+                const rawPrefix = {prefix_js};
+                let valueToFill = rawPrefix;
+                if (targetLen > 0 && rawPrefix.length >= targetLen) {{
+                    valueToFill = rawPrefix.substring(0, targetLen);
+                }}
+
                 // Fill credit_card_prefix using native setter
-                const is_set = setNativeInputValue(input1, {prefix_js});
+                const is_set = setNativeInputValue(input1, valueToFill);
 
                 // Trigger submit via button click or DoVIPLogin function
                 const submitBtn = popup.querySelector('button[onclick*="DoVIPLogin"], button.red');
                 if (submitBtn) {{
                     submitBtn.click();
-                    return {{ found: true, filled: is_set, submitted: true, method: 'btn_click' }};
+                    return {{
+                        found: true,
+                        filled: is_set,
+                        submitted: true,
+                        method: 'btn_click',
+                        targetLen: targetLen,
+                        actualLen: valueToFill.length,
+                        hasShorterConfig: (targetLen > 0 && rawPrefix.length < targetLen)
+                    }};
                 }} else if (typeof DoVIPLogin === 'function') {{
                     DoVIPLogin();
-                    return {{ found: true, filled: is_set, submitted: true, method: 'func_call' }};
+                    return {{
+                        found: true,
+                        filled: is_set,
+                        submitted: true,
+                        method: 'func_call',
+                        targetLen: targetLen,
+                        actualLen: valueToFill.length,
+                        hasShorterConfig: (targetLen > 0 && rawPrefix.length < targetLen)
+                    }};
                 }}
 
                 return {{ found: true, filled: is_set, submitted: false, reason: 'no_submit_btn' }};
@@ -385,8 +434,13 @@ async def nodriver_kham_check_vip_priority_dialog(tab, config_dict):
                 debug.log("[KHAM VIP] VIP priority purchase request is already in-flight")
                 return True
             if result.get('submitted'):
-                masked_prefix = credit_card_prefix[:2] + "****" if len(credit_card_prefix) >= 2 else "****"
-                debug.log(f"[KHAM VIP] Card prefix filled ({masked_prefix}) and submitted via {result.get('method')}")
+                actual_len = result.get('actualLen', len(credit_card_prefix))
+                target_len = result.get('targetLen', 0)
+                masked_prefix = credit_card_prefix[:2] + "*" * (actual_len - 2) if actual_len >= 2 else "****"
+                len_info = f"target={target_len} digits, filled {actual_len} digits" if target_len > 0 else f"{actual_len} digits"
+                debug.log(f"[KHAM VIP] Card prefix filled ({masked_prefix}, {len_info}) and submitted via {result.get('method')}")
+                if result.get('hasShorterConfig'):
+                    debug.log(f"[KHAM VIP] WARNING: Event requested {target_len} digits, but credit_card_prefix only configured with {len(credit_card_prefix)} digits")
                 return True
             if result.get('found'):
                 debug.log(f"[KHAM VIP] VIP popup found but not submitted: {result.get('reason')}")
@@ -3307,22 +3361,13 @@ async def nodriver_kham_seat_type_auto_select(tab, config_dict, area_keyword_ite
             debug.log("[KHAM SEAT TYPE] No ticket type buttons found")
             return False
 
-        # Step 4: Filter disabled buttons, then apply keyword_exclude here so that
-        # keyword matching and the first-button fallback below share one clean
-        # candidate list -- an excluded seat type can never be auto-picked.
-        enabled_buttons = []
-        for btn in ticket_buttons:
-            if btn['disabled']:
-                continue
-            if util.reset_row_text_if_match_keyword_exclude(config_dict, btn.get('text', '')):
-                debug.log(f"[KHAM SEAT TYPE] Excluded by keyword_exclude: {btn.get('text', '')}")
-                continue
-            enabled_buttons.append(btn)
+        # Step 4: Filter disabled buttons
+        enabled_buttons = [btn for btn in ticket_buttons if not btn['disabled']]
 
         debug.log(f"[KHAM SEAT TYPE] Found {len(enabled_buttons)} enabled button(s)")
 
         if len(enabled_buttons) == 0:
-            debug.log("[KHAM SEAT TYPE] All buttons are disabled or excluded")
+            debug.log("[KHAM SEAT TYPE] All buttons are disabled")
             return False
 
         # Step 5: Match and select button using Python logic
@@ -3331,6 +3376,11 @@ async def nodriver_kham_seat_type_auto_select(tab, config_dict, area_keyword_ite
         for btn in enabled_buttons:
             button_text = btn.get('text', '')
             if not button_text:
+                continue
+
+            # 使用 util 檢查是否應該排除（依據設定檔的 keyword_exclude）
+            if util.reset_row_text_if_match_keyword_exclude(config_dict, button_text):
+                debug.log(f"[KHAM SEAT TYPE] Excluded by keyword_exclude: {button_text}")
                 continue
 
             # 關鍵字匹配邏輯
@@ -4539,30 +4589,26 @@ async def nodriver_ticket_seat_type_auto_select(tab, config_dict, area_keyword_i
             debug.log("[TICKET SEAT TYPE] No ticket type buttons found")
             return False
 
-        # Step 4: Filter disabled buttons, then apply keyword_exclude here so that
-        # keyword matching and the first-button fallback below share one clean
-        # candidate list -- an excluded seat type can never be auto-picked.
-        enabled_buttons = []
-        for btn in ticket_buttons:
-            if btn['disabled']:
-                continue
-            if util.reset_row_text_if_match_keyword_exclude(config_dict, btn['text']):
-                debug.log(f"[TICKET SEAT TYPE] Excluded by keyword_exclude: {btn['text']}")
-                continue
-            enabled_buttons.append(btn)
+        # Step 4: Filter disabled buttons
+        enabled_buttons = [btn for btn in ticket_buttons if not btn['disabled']]
 
         debug.log(f"[TICKET SEAT TYPE] Found {len(enabled_buttons)} enabled button(s)")
 
         if len(enabled_buttons) == 0:
-            debug.log("[TICKET SEAT TYPE] All buttons are disabled or excluded")
+            debug.log("[TICKET SEAT TYPE] All buttons are disabled")
             return False
 
-        # Step 5: Match button using keyword logic
+        # Step 5: Match button using keyword and exclusion logic
         matched_button = None
 
         for button in enabled_buttons:
             button_text = button['text']
             if not button_text:
+                continue
+
+            # Check exclusion keywords from config
+            if util.reset_row_text_if_match_keyword_exclude(config_dict, button_text):
+                debug.log(f"[TICKET SEAT TYPE] Excluded by keyword_exclude: {button_text}")
                 continue
 
             # Keyword matching logic
